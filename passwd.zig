@@ -1,5 +1,77 @@
 const std = @import("std");
 
+// TODO: scan implementation
+// TODO: if memory runs out, free everything and fallback to slow scan
+
+pub const GroupDatabase = struct {
+    allocator: std.mem.Allocator,
+    buffer: []const u8,
+
+    pub const Entry = struct {
+        name: []const u8,
+        password: []const u8,
+        gid: u32,
+        groups: []const u8,
+    };
+
+    pub const EntryIterator = struct {
+        buffer: []const u8,
+        line_it: LineIterator,
+
+        pub fn init(buffer: []const u8) EntryIterator {
+            return .{
+                .buffer = buffer,
+                .line_it = LineIterator.init(buffer),
+            };
+        }
+
+        pub fn next(this: *EntryIterator) ?Entry {
+            while (this.line_it.next()) |line| {
+                const entry = GroupDatabase.parse(line) catch continue;
+                return entry;
+            }
+
+            return null;
+        }
+    };
+
+    pub fn deinit(this: GroupDatabase) void {
+        this.allocator.free(this.buffer);
+    }
+
+    pub fn find(this: GroupDatabase, name: []const u8) ?Entry {
+        var it = EntryIterator.init(this.buffer);
+
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) {
+                return entry;
+            }
+        }
+
+        return null;
+    }
+
+    pub fn iterator(this: GroupDatabase) EntryIterator {
+        return EntryIterator.init(this.buffer);
+    }
+
+    pub fn parse(entry_line: []const u8) !Entry {
+        var entry: Entry = undefined;
+        var field_it = FieldIterator.init(entry_line);
+
+        entry.name = field_it.next() orelse return error.EndOfStream;
+        entry.password = field_it.next() orelse return error.EndOfStream;
+        const gid = field_it.next() orelse return error.EndOfStream;
+        entry.groups = field_it.next() orelse return error.EndOfStream;
+
+        if (field_it.next() != null) return error.StreamTooLong;
+
+        entry.gid = try std.fmt.parseInt(u32, gid, 10);
+
+        return entry;
+    }
+};
+
 pub const PasswdDatabase = struct {
     allocator: std.mem.Allocator,
     buffer: []const u8,
@@ -16,12 +88,12 @@ pub const PasswdDatabase = struct {
 
     pub const EntryIterator = struct {
         buffer: []const u8,
-        line_it: DelimitedBufferIterator(u8),
+        line_it: LineIterator,
 
         pub fn init(buffer: []const u8) EntryIterator {
             return .{
                 .buffer = buffer,
-                .line_it = DelimitedBufferIterator(u8).init(buffer, '\n'),
+                .line_it = LineIterator.init(buffer),
             };
         }
 
@@ -57,7 +129,7 @@ pub const PasswdDatabase = struct {
 
     pub fn parse(entry_line: []const u8) !Entry {
         var entry: Entry = undefined;
-        var field_it = DelimitedBufferIterator(u8).init(entry_line, ':');
+        var field_it = FieldIterator.init(entry_line);
 
         entry.login = field_it.next() orelse return error.EndOfStream;
         entry.password = field_it.next() orelse return error.EndOfStream;
@@ -72,7 +144,7 @@ pub const PasswdDatabase = struct {
         entry.uid = try std.fmt.parseInt(u32, uid, 10);
         entry.gid = try std.fmt.parseInt(u32, gid, 10);
 
-        var info_it = DelimitedBufferIterator(u8).init(info, ',');
+        var info_it = InfoIterator.init(info);
 
         entry.info[0] = info_it.next() orelse "";
         entry.info[1] = info_it.next() orelse "";
@@ -85,23 +157,43 @@ pub const PasswdDatabase = struct {
     }
 };
 
-fn DelimitedBufferIterator(comptime T: type) type {
+const LineIterator = DelimitedBufferIterator(u8, '\n', .terminator);
+const FieldIterator = DelimitedBufferIterator(u8, ':', .separator);
+const InfoIterator = DelimitedBufferIterator(u8, ',', .separator);
+
+const DelimitMode = enum {
+    separator,
+    terminator,
+};
+
+fn DelimitedBufferIterator(comptime T: type, delim: T, mode: DelimitMode) type {
     return struct {
         buffer: []const T,
-        delim: T,
         offset: usize = 0,
 
-        pub fn init(buffer: []const T, delim: T) @This() {
-            return .{ .buffer = buffer, .delim = delim };
+        pub fn init(buffer: []const T) @This() {
+            return .{ .buffer = buffer };
         }
 
         pub fn next(this: *@This()) ?[]const T {
             const buf = this.buffer;
             const start = this.offset;
-            const delim = this.delim;
 
-            if (start >= buf.len) {
+            if (start > buf.len) {
                 return null;
+            } else if (start == buf.len) {
+                this.offset += 1;
+
+                switch (mode) {
+                    .terminator => return null,
+                    .separator => {
+                        if (start > 0 and buf[start - 1] == delim) {
+                            return "";
+                        } else {
+                            return null;
+                        }
+                    },
+                }
             } else if (std.mem.indexOfScalarPos(u8, buf, start, delim)) |end| {
                 this.offset = end + 1;
                 return buf[start..end];
@@ -113,8 +205,24 @@ fn DelimitedBufferIterator(comptime T: type) type {
     };
 }
 
+pub fn open_group(allocator: std.mem.Allocator) GroupDatabase {
+    return open_group_file(allocator, "/etc/group");
+}
+
 pub fn open_passwd(allocator: std.mem.Allocator) PasswdDatabase {
     return open_passwd_file(allocator, "/etc/passwd");
+}
+
+pub fn open_group_file(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) GroupDatabase {
+    const buffer = read_file(allocator, path) catch &.{};
+
+    return GroupDatabase{
+        .allocator = allocator,
+        .buffer = buffer,
+    };
 }
 
 pub fn open_passwd_file(
@@ -140,7 +248,51 @@ fn read_file(
     return buffer;
 }
 
-test "opening database" {
+test "reading group database" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const data =
+        \\root:x:0:
+        \\daemon:x:1:
+        \\bin:x:2:
+        \\--junk data--
+        \\mli:x:101:foo,bar
+        \\
+    ;
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "group", .data = data });
+    const path = try tmp_dir.dir.realpathAlloc(allocator, "group");
+    const db = open_group_file(allocator, path);
+
+    var entry_it = db.iterator();
+    var count: usize = 0;
+
+    while (entry_it.next()) |_| {
+        count += 1;
+    }
+
+    try std.testing.expectEqual(4, count);
+
+    const root = db.find("root").?;
+    const mli = db.find("mli").?;
+
+    try std.testing.expectEqualStrings("root", root.name);
+    try std.testing.expectEqualStrings("x", root.password);
+    try std.testing.expectEqual(0, root.gid);
+    try std.testing.expectEqualStrings("", root.groups);
+
+    try std.testing.expectEqualStrings("mli", mli.name);
+    try std.testing.expectEqualStrings("x", mli.password);
+    try std.testing.expectEqual(101, mli.gid);
+    try std.testing.expectEqualStrings("foo,bar", mli.groups);
+}
+
+test "reading passwd database" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
