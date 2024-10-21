@@ -3,60 +3,49 @@ const std = @import("std");
 // TODO: scan implementation
 // TODO: if memory runs out, free everything and fallback to slow scan
 
-pub const GroupDatabase = struct {
+pub const GroupDatabase = Database(GroupEntry);
+pub const PasswdDatabase = Database(PasswdEntry);
+
+pub fn open_group(allocator: std.mem.Allocator) GroupDatabase {
+    return open_group_file(allocator, "/etc/group");
+}
+
+pub fn open_passwd(allocator: std.mem.Allocator) PasswdDatabase {
+    return open_passwd_file(allocator, "/etc/passwd");
+}
+
+pub fn open_group_file(
     allocator: std.mem.Allocator,
-    buffer: []const u8,
+    path: []const u8,
+) GroupDatabase {
+    const buffer = read_file(allocator, path) catch &.{};
 
-    pub const Entry = struct {
-        name: []const u8,
-        password: []const u8,
-        gid: u32,
-        groups: []const u8,
+    return GroupDatabase{
+        .allocator = allocator,
+        .buffer = buffer,
     };
+}
 
-    pub const EntryIterator = struct {
-        buffer: []const u8,
-        line_it: LineIterator,
+pub fn open_passwd_file(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) PasswdDatabase {
+    const buffer = read_file(allocator, path) catch &.{};
 
-        pub fn init(buffer: []const u8) EntryIterator {
-            return .{
-                .buffer = buffer,
-                .line_it = LineIterator.init(buffer),
-            };
-        }
-
-        pub fn next(this: *EntryIterator) ?Entry {
-            while (this.line_it.next()) |line| {
-                const entry = GroupDatabase.parse(line) catch continue;
-                return entry;
-            }
-
-            return null;
-        }
+    return PasswdDatabase{
+        .allocator = allocator,
+        .buffer = buffer,
     };
+}
 
-    pub fn deinit(this: GroupDatabase) void {
-        this.allocator.free(this.buffer);
-    }
+pub const GroupEntry = struct {
+    name: []const u8,
+    password: []const u8,
+    gid: u32,
+    groups: []const u8,
 
-    pub fn find(this: GroupDatabase, name: []const u8) ?Entry {
-        var it = EntryIterator.init(this.buffer);
-
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) {
-                return entry;
-            }
-        }
-
-        return null;
-    }
-
-    pub fn iterator(this: GroupDatabase) EntryIterator {
-        return EntryIterator.init(this.buffer);
-    }
-
-    pub fn parse(entry_line: []const u8) !Entry {
-        var entry: Entry = undefined;
+    pub fn parse(entry_line: []const u8) !GroupEntry {
+        var entry: GroupEntry = undefined;
         var field_it = FieldIterator.init(entry_line);
 
         entry.name = field_it.next() orelse return error.EndOfStream;
@@ -72,66 +61,20 @@ pub const GroupDatabase = struct {
     }
 };
 
-pub const PasswdDatabase = struct {
-    allocator: std.mem.Allocator,
-    buffer: []const u8,
+pub const PasswdEntry = struct {
+    name: []const u8,
+    password: []const u8,
+    uid: u32,
+    gid: u32,
+    info: [5][]const u8,
+    home: []const u8,
+    shell: []const u8,
 
-    pub const Entry = struct {
-        login: []const u8,
-        password: []const u8,
-        uid: u32,
-        gid: u32,
-        info: [5][]const u8,
-        home: []const u8,
-        shell: []const u8,
-    };
-
-    pub const EntryIterator = struct {
-        buffer: []const u8,
-        line_it: LineIterator,
-
-        pub fn init(buffer: []const u8) EntryIterator {
-            return .{
-                .buffer = buffer,
-                .line_it = LineIterator.init(buffer),
-            };
-        }
-
-        pub fn next(this: *EntryIterator) ?Entry {
-            while (this.line_it.next()) |line| {
-                const entry = PasswdDatabase.parse(line) catch continue;
-                return entry;
-            }
-
-            return null;
-        }
-    };
-
-    pub fn deinit(this: PasswdDatabase) void {
-        this.allocator.free(this.buffer);
-    }
-
-    pub fn find(this: PasswdDatabase, login: []const u8) ?Entry {
-        var it = EntryIterator.init(this.buffer);
-
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.login, login)) {
-                return entry;
-            }
-        }
-
-        return null;
-    }
-
-    pub fn iterator(this: PasswdDatabase) EntryIterator {
-        return EntryIterator.init(this.buffer);
-    }
-
-    pub fn parse(entry_line: []const u8) !Entry {
-        var entry: Entry = undefined;
+    pub fn parse(entry_line: []const u8) !PasswdEntry {
+        var entry: PasswdEntry = undefined;
         var field_it = FieldIterator.init(entry_line);
 
-        entry.login = field_it.next() orelse return error.EndOfStream;
+        entry.name = field_it.next() orelse return error.EndOfStream;
         entry.password = field_it.next() orelse return error.EndOfStream;
         const uid = field_it.next() orelse return error.EndOfStream;
         const gid = field_it.next() orelse return error.EndOfStream;
@@ -156,6 +99,55 @@ pub const PasswdDatabase = struct {
         return entry;
     }
 };
+
+fn Database(comptime Entry: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        buffer: []const u8,
+
+        pub const EntryIterator = struct {
+            buffer: []const u8,
+            line_it: LineIterator,
+
+            pub fn init(buffer: []const u8) EntryIterator {
+                return .{
+                    .buffer = buffer,
+                    .line_it = LineIterator.init(buffer),
+                };
+            }
+
+            pub fn next(this: *EntryIterator) ?Entry {
+                while (this.line_it.next()) |line| {
+                    const entry = Entry.parse(line) catch continue;
+                    return entry;
+                }
+
+                return null;
+            }
+        };
+
+        pub fn deinit(this: @This()) void {
+            this.allocator.free(this.buffer);
+        }
+
+        pub fn find(this: @This(), name: []const u8) ?Entry {
+            var it = EntryIterator.init(this.buffer);
+
+            while (it.next()) |entry| {
+                // TODO: add Entry method to match
+                if (std.mem.eql(u8, entry.name, name)) {
+                    return entry;
+                }
+            }
+
+            return null;
+        }
+
+        pub fn iterator(this: @This()) EntryIterator {
+            return EntryIterator.init(this.buffer);
+        }
+    };
+}
 
 const LineIterator = DelimitedBufferIterator(u8, '\n', .terminator);
 const FieldIterator = DelimitedBufferIterator(u8, ':', .separator);
@@ -202,38 +194,6 @@ fn DelimitedBufferIterator(comptime T: type, delim: T, mode: DelimitMode) type {
                 return buf[start..];
             }
         }
-    };
-}
-
-pub fn open_group(allocator: std.mem.Allocator) GroupDatabase {
-    return open_group_file(allocator, "/etc/group");
-}
-
-pub fn open_passwd(allocator: std.mem.Allocator) PasswdDatabase {
-    return open_passwd_file(allocator, "/etc/passwd");
-}
-
-pub fn open_group_file(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) GroupDatabase {
-    const buffer = read_file(allocator, path) catch &.{};
-
-    return GroupDatabase{
-        .allocator = allocator,
-        .buffer = buffer,
-    };
-}
-
-pub fn open_passwd_file(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-) PasswdDatabase {
-    const buffer = read_file(allocator, path) catch &.{};
-
-    return PasswdDatabase{
-        .allocator = allocator,
-        .buffer = buffer,
     };
 }
 
@@ -331,7 +291,7 @@ test "reading passwd database" {
     const root = db.find("root").?;
     const mli = db.find("mli").?;
 
-    try std.testing.expectEqualStrings("root", root.login);
+    try std.testing.expectEqualStrings("root", root.name);
     try std.testing.expectEqualStrings("x", root.password);
     try std.testing.expectEqual(0, root.uid);
     try std.testing.expectEqual(0, root.gid);
@@ -343,7 +303,7 @@ test "reading passwd database" {
     try std.testing.expectEqualStrings("/root", root.home);
     try std.testing.expectEqualStrings("/bin/bash", root.shell);
 
-    try std.testing.expectEqualStrings("mli", mli.login);
+    try std.testing.expectEqualStrings("mli", mli.name);
     try std.testing.expectEqualStrings("x", mli.password);
     try std.testing.expectEqual(101, mli.uid);
     try std.testing.expectEqual(101, mli.gid);
