@@ -1,6 +1,11 @@
 Library for reading **/etc/passwd** database.  Provides a static alternative to
 linking with libc and relying on NSS.
 
+Deprecated
+==========
+This library has been deprecated.  Use
+[richRemer/zig-nss](https://github.com/richRemer/zig-nss) instead.
+
 Examples
 ========
 
